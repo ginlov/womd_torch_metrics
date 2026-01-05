@@ -51,7 +51,7 @@ class MotionMetricsConfig:
     
     # Track and prediction frequency
     track_steps_per_second: int = 10  # Ground truth frequency (Hz)
-    prediction_steps_per_second: int = 2  # Prediction frequency (Hz)
+    prediction_steps_per_second: int = 10  # Prediction frequency (Hz)
     
     # Track sample counts
     track_history_samples: int = 10  # Number of history timesteps
@@ -75,11 +75,11 @@ class MotionMetricsConfig:
     def __post_init__(self):
         if self.step_configurations is None:
             # Default: Official Waymo challenge config
-            # At 2Hz prediction: step 5 = 3s, step 9 = 5s, step 15 = 8s
+            # At 10Hz prediction: step 30 = 3s, step 50 = 5s, step 80 = 8s
             self.step_configurations = [
-                StepConfig(measurement_step=5, lateral_miss_threshold=1.0, longitudinal_miss_threshold=2.0),
-                StepConfig(measurement_step=9, lateral_miss_threshold=1.8, longitudinal_miss_threshold=3.6),
-                StepConfig(measurement_step=15, lateral_miss_threshold=3.0, longitudinal_miss_threshold=6.0),
+                StepConfig(measurement_step=30, lateral_miss_threshold=1.0, longitudinal_miss_threshold=2.0),
+                StepConfig(measurement_step=50, lateral_miss_threshold=1.8, longitudinal_miss_threshold=3.6),
+                StepConfig(measurement_step=80, lateral_miss_threshold=3.0, longitudinal_miss_threshold=6.0),
             ]
 
 
@@ -789,8 +789,9 @@ def compute_average_precision(
             max_precision[i] = torch.maximum(precision[i], max_precision[i + 1])
     
     # Compute AP as area under interpolated curve
+    # Area = sum of (recall_i+1 - recall_i) * precision_i
     recall_diff = recall[1:] - recall[:-1]
-    ap = torch.sum(recall_diff * max_precision[1:])
+    ap = torch.sum(recall_diff * max_precision[:-1])
     
     return ap
 
