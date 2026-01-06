@@ -15,6 +15,28 @@ from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 import math
 
+# Import trajectory-aligned displacement utilities
+from .displacement_utils import (
+    compute_lateral_longitudinal_displacement,
+    compute_displacement_at_step,
+    extract_heading_from_trajectory,
+    check_within_thresholds,
+)
+
+# Import trajectory classification
+from .trajectory_classification import (
+    classify_trajectory_type,
+    get_trajectory_type_name,
+    TRAJECTORY_TYPE_STATIONARY,
+    TRAJECTORY_TYPE_STRAIGHT,
+    TRAJECTORY_TYPE_STRAIGHT_LEFT,
+    TRAJECTORY_TYPE_STRAIGHT_RIGHT,
+    TRAJECTORY_TYPE_LEFT_U_TURN,
+    TRAJECTORY_TYPE_LEFT_TURN,
+    TRAJECTORY_TYPE_RIGHT_U_TURN,
+    TRAJECTORY_TYPE_RIGHT_TURN,
+)
+
 
 # Object type constants (matching Waymo Open Dataset)
 TYPE_UNSET = 0
@@ -22,16 +44,6 @@ TYPE_VEHICLE = 1
 TYPE_PEDESTRIAN = 2
 TYPE_CYCLIST = 3
 TYPE_OTHER = 4
-
-# Trajectory type constants for mAP computation
-TRAJECTORY_TYPE_STATIONARY = 0
-TRAJECTORY_TYPE_STRAIGHT = 1
-TRAJECTORY_TYPE_STRAIGHT_LEFT = 2
-TRAJECTORY_TYPE_STRAIGHT_RIGHT = 3
-TRAJECTORY_TYPE_LEFT_U_TURN = 4
-TRAJECTORY_TYPE_LEFT_TURN = 5
-TRAJECTORY_TYPE_RIGHT_U_TURN = 6
-TRAJECTORY_TYPE_RIGHT_TURN = 7
 
 
 @dataclass
@@ -105,186 +117,6 @@ def compute_displacement_error(
         errors = errors * valid_mask.float()
     
     return errors
-
-
-def compute_min_ade(
-    pred_trajectories: torch.Tensor,
-    gt_trajectory: torch.Tensor,
-    valid_mask: Optional[torch.Tensor] = None,
-    measurement_step: Optional[int] = None,
-) -> torch.Tensor:
-    """
-    Compute minimum Average Displacement Error (minADE).
-    
-    Args:
-        pred_trajectories: [K, T, 2] K predicted trajectories, each with T timesteps
-        gt_trajectory: [T, 2] or [T, 7] ground truth trajectory
-            If [T, 7]: [x, y, length, width, heading, velocity_x, velocity_y]
-            If [T, 2]: [x, y] only
-        valid_mask: [T] optional mask for valid timesteps
-        measurement_step: if provided, only evaluate up to this step
-        
-    Returns:
-        Scalar tensor with minADE value
-    """
-    # Extract x, y if 7D format
-    if gt_trajectory.shape[-1] >= 7:
-        gt_trajectory = gt_trajectory[..., :2]
-    
-    if measurement_step is not None:
-        pred_trajectories = pred_trajectories[:, :measurement_step, :]
-        gt_trajectory = gt_trajectory[:measurement_step, :]
-        if valid_mask is not None:
-            valid_mask = valid_mask[:measurement_step]
-    
-    # Compute ADE for each prediction: [K, T]
-    errors = compute_displacement_error(
-        pred_trajectories,  # [K, T, 2]
-        gt_trajectory.unsqueeze(0),  # [1, T, 2]
-        valid_mask.unsqueeze(0) if valid_mask is not None else None,
-    )
-    
-    # Average over timesteps: [K]
-    if valid_mask is not None:
-        ade_per_pred = errors.sum(dim=-1) / valid_mask.sum().clamp(min=1.0)
-    else:
-        ade_per_pred = errors.mean(dim=-1)
-    
-    # Take minimum across K predictions
-    min_ade = ade_per_pred.min()
-    
-    return min_ade
-
-
-def compute_min_fde(
-    pred_trajectories: torch.Tensor,
-    gt_trajectory: torch.Tensor,
-    valid_mask: Optional[torch.Tensor] = None,
-    measurement_step: Optional[int] = None,
-) -> torch.Tensor:
-    """
-    Compute minimum Final Displacement Error (minFDE).
-    
-    Args:
-        pred_trajectories: [K, T, 2] K predicted trajectories
-        gt_trajectory: [T, 2] or [T, 7] ground truth trajectory
-            If [T, 7]: [x, y, length, width, heading, velocity_x, velocity_y]
-            If [T, 2]: [x, y] only
-        valid_mask: [T] optional mask for valid timesteps
-        measurement_step: if provided, evaluate at this step (0-indexed)
-        
-    Returns:
-        Scalar tensor with minFDE value
-    """
-    # Extract x, y if 7D format
-    gt_xy = gt_trajectory[..., :2] if gt_trajectory.shape[-1] >= 7 else gt_trajectory
-    
-    if measurement_step is not None:
-        # Evaluate at specific step
-        pred_final = pred_trajectories[:, measurement_step - 1, :]  # [K, 2]
-        gt_final = gt_xy[measurement_step - 1, :]  # [2]
-    else:
-        # Evaluate at final step
-        pred_final = pred_trajectories[:, -1, :]  # [K, 2]
-        gt_final = gt_xy[-1, :]  # [2]
-    
-    # Compute FDE for each prediction: [K]
-    fde_per_pred = torch.norm(pred_final - gt_final, dim=-1)
-    
-    # Take minimum across K predictions
-    min_fde = fde_per_pred.min()
-    
-    return min_fde
-
-
-def compute_miss_rate(
-    pred_trajectories: torch.Tensor,
-    gt_trajectory: torch.Tensor,
-    lateral_threshold: float,
-    longitudinal_threshold: float,
-    gt_heading: Optional[torch.Tensor] = None,
-    valid_mask: Optional[torch.Tensor] = None,
-    measurement_step: Optional[int] = None,
-) -> torch.Tensor:
-    """
-    Compute miss rate using lateral and longitudinal displacement thresholds.
-    
-    The official Waymo implementation decomposes the displacement error into:
-    - Lateral: perpendicular to the heading direction
-    - Longitudinal: along the heading direction
-    
-    A prediction misses if EITHER lateral OR longitudinal error exceeds its threshold.
-    
-    Args:
-        pred_trajectories: [K, T, 2] K predicted trajectories (x, y)
-        gt_trajectory: [T, 2] or [T, 7] ground truth trajectory
-            If [T, 7]: [x, y, length, width, heading, velocity_x, velocity_y]
-            If [T, 2]: [x, y] only (requires gt_heading parameter)
-        lateral_threshold: lateral miss threshold in meters
-        longitudinal_threshold: longitudinal miss threshold in meters
-        gt_heading: [T] optional heading angles if not in gt_trajectory
-        valid_mask: [T] optional mask for valid timesteps
-        measurement_step: if provided, evaluate at this step
-        
-    Returns:
-        Scalar tensor with miss rate (0.0 to 1.0)
-    """
-    if measurement_step is not None:
-        # Evaluate at specific step
-        pred_final = pred_trajectories[:, measurement_step - 1, :]  # [K, 2]
-        if gt_trajectory.shape[-1] >= 7:
-            gt_final = gt_trajectory[measurement_step - 1, :2]  # [2] - extract x, y
-            heading = gt_trajectory[measurement_step - 1, 4]  # scalar - extract heading
-        else:
-            gt_final = gt_trajectory[measurement_step - 1, :]  # [2]
-            heading = gt_heading[measurement_step - 1] if gt_heading is not None else None
-    else:
-        # Evaluate at final step
-        pred_final = pred_trajectories[:, -1, :]  # [K, 2]
-        if gt_trajectory.shape[-1] >= 7:
-            gt_final = gt_trajectory[-1, :2]  # [2]
-            heading = gt_trajectory[-1, 4]  # scalar
-        else:
-            gt_final = gt_trajectory[-1, :]  # [2]
-            heading = gt_heading[-1] if gt_heading is not None else None
-    
-    # Compute displacement errors for each prediction: [K, 2]
-    displacements = pred_final - gt_final  # [K, 2]
-    
-    if heading is not None:
-        # Decompose into lateral and longitudinal components
-        # heading is the direction of motion (yaw angle)
-        cos_h = torch.cos(heading)
-        sin_h = torch.sin(heading)
-        
-        # Longitudinal: component along heading direction
-        # longitudinal = displacement_x * cos(heading) + displacement_y * sin(heading)
-        longitudinal = displacements[:, 0] * cos_h + displacements[:, 1] * sin_h  # [K]
-        
-        # Lateral: component perpendicular to heading direction
-        # lateral = -displacement_x * sin(heading) + displacement_y * cos(heading)
-        lateral = -displacements[:, 0] * sin_h + displacements[:, 1] * cos_h  # [K]
-        
-        # Take absolute values for threshold comparison
-        lateral_errors = torch.abs(lateral)  # [K]
-        longitudinal_errors = torch.abs(longitudinal)  # [K]
-        
-        # Find the best prediction (minimum combined error)
-        # A prediction misses if lateral > lateral_threshold OR longitudinal > longitudinal_threshold
-        lateral_miss = lateral_errors > lateral_threshold  # [K]
-        longitudinal_miss = longitudinal_errors > longitudinal_threshold  # [K]
-        prediction_misses = lateral_miss | longitudinal_miss  # [K]
-        
-        # Check if all predictions miss
-        miss = prediction_misses.all().float()
-    else:
-        # Fallback: use Euclidean distance with lateral threshold
-        # This is a simplified approach when heading is not available
-        fde_per_pred = torch.norm(displacements, dim=-1)  # [K]
-        min_fde = fde_per_pred.min()
-        miss = (min_fde > lateral_threshold).float()
-    
-    return miss
 
 
 def box_to_corners(center_x: torch.Tensor, center_y: torch.Tensor, 
@@ -393,33 +225,6 @@ def line_segment_intersection(p1: torch.Tensor, p2: torch.Tensor,
     return False, None
 
 
-def point_in_polygon(point: torch.Tensor, polygon: torch.Tensor) -> bool:
-    """
-    Check if a point is inside a polygon using ray casting.
-    
-    Args:
-        point: [2] point coordinates
-        polygon: [N, 2] polygon vertices
-        
-    Returns:
-        True if point is inside polygon
-    """
-    x, y = point[0].item(), point[1].item()
-    n = polygon.shape[0]
-    inside = False
-    
-    j = n - 1
-    for i in range(n):
-        xi, yi = polygon[i, 0].item(), polygon[i, 1].item()
-        xj, yj = polygon[j, 0].item(), polygon[j, 1].item()
-        
-        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
-            inside = not inside
-        j = i
-    
-    return inside
-
-
 def polygon_intersection(poly1: torch.Tensor, poly2: torch.Tensor) -> torch.Tensor:
     """
     Compute intersection of two convex polygons using Sutherland-Hodgman algorithm.
@@ -523,200 +328,6 @@ def compute_polygon_iou(box1_corners: torch.Tensor, box2_corners: torch.Tensor) 
     return iou.clamp(0.0, 1.0)
 
 
-def compute_overlap_rate(
-    pred_trajectories: torch.Tensor,
-    gt_trajectory: torch.Tensor,
-    gt_boxes: torch.Tensor,
-    threshold: float = 0.5,
-    valid_mask: Optional[torch.Tensor] = None,
-    measurement_step: Optional[int] = None,
-) -> torch.Tensor:
-    """
-    Compute overlap rate using proper polygon IoU for oriented bounding boxes.
-    
-    This implementation uses the Sutherland-Hodgman algorithm to compute the
-    intersection of rotated rectangles and calculates true IoU (Intersection
-    over Union) values, matching the official Waymo implementation.
-    
-    Args:
-        pred_trajectories: [K, T, 2] K predicted trajectories (center positions)
-        gt_trajectory: [T, 2] or [T, 7] ground truth trajectory
-            If [T, 7]: [x, y, length, width, heading, velocity_x, velocity_y]
-            If [T, 2]: [x, y] only
-        gt_boxes: [T, 4] ground truth boxes [length, width, heading, velocity_heading]
-                  or [T, 5] [x, y, length, width, heading]
-        threshold: IoU threshold for overlap (default: 0.5)
-        valid_mask: [T] optional mask for valid timesteps
-        measurement_step: if provided, evaluate at this step
-        
-    Returns:
-        Scalar tensor with overlap rate (0.0 to 1.0)
-    """
-    # Extract x, y if 7D format
-    gt_xy = gt_trajectory[..., :2] if gt_trajectory.shape[-1] >= 7 else gt_trajectory
-    
-    if measurement_step is not None:
-        pred_trajectories = pred_trajectories[:, :measurement_step, :]
-        gt_xy = gt_xy[:measurement_step, :]
-        gt_boxes = gt_boxes[:measurement_step, :]
-        if valid_mask is not None:
-            valid_mask = valid_mask[:measurement_step]
-    
-    # Compute proper polygon IoU for oriented bounding boxes
-    K, T, _ = pred_trajectories.shape
-    
-    # Extract box dimensions from gt_trajectory (7D) or gt_boxes
-    if gt_trajectory.shape[-1] >= 7:
-        # Use dimensions and heading from 7D ground truth
-        gt_lengths = gt_trajectory[..., 2]  # [T]
-        gt_widths = gt_trajectory[..., 3]  # [T]
-        gt_headings = gt_trajectory[..., 4]  # [T]
-    elif gt_boxes.shape[-1] >= 3:
-        # Use dimensions from gt_boxes
-        gt_lengths = gt_boxes[..., 0]  # [T]
-        gt_widths = gt_boxes[..., 1]  # [T]
-        gt_headings = gt_boxes[..., 2] if gt_boxes.shape[-1] > 2 else torch.zeros(T, device=gt_xy.device)
-    else:
-        # Default box size if not provided
-        gt_lengths = torch.ones(T, device=gt_xy.device) * 4.5  # meters
-        gt_widths = torch.ones(T, device=gt_xy.device) * 2.0  # meters
-        gt_headings = torch.zeros(T, device=gt_xy.device)  # radians
-    
-    # Assume prediction boxes have same dimensions as GT (typical assumption)
-    # In practice, predictions might have their own box dimensions
-    pred_lengths = gt_lengths
-    pred_widths = gt_widths
-    
-    # For each prediction, check if it overlaps at any timestep
-    overlaps = []
-    for k in range(K):
-        pred_pos = pred_trajectories[k]  # [T, 2]
-        has_overlap = False
-        
-        for t in range(T):
-            if valid_mask is not None and not valid_mask[t]:
-                continue
-            
-            # Get box corners for prediction
-            # Assume prediction heading aligns with velocity direction or uses GT heading
-            pred_heading = gt_headings[t]  # Simplified: use GT heading
-            pred_corners = box_to_corners(
-                pred_pos[t, 0], pred_pos[t, 1],
-                pred_lengths[t], pred_widths[t], pred_heading
-            )
-            
-            # Get box corners for ground truth
-            gt_corners = box_to_corners(
-                gt_xy[t, 0], gt_xy[t, 1],
-                gt_lengths[t], gt_widths[t], gt_headings[t]
-            )
-            
-            # Compute IoU
-            iou = compute_polygon_iou(pred_corners, gt_corners)
-            
-            # Check if IoU exceeds threshold
-            if iou > threshold:
-                has_overlap = True
-                break
-        
-        overlaps.append(torch.tensor(1.0 if has_overlap else 0.0, device=gt_xy.device))
-    
-    # Overlap rate: fraction of predictions that overlap
-    overlap_rate = torch.stack(overlaps).mean()
-    
-    return overlap_rate
-
-
-def classify_trajectory_type(
-    trajectory: torch.Tensor,
-    valid_mask: Optional[torch.Tensor] = None,
-) -> int:
-    """
-    Classify trajectory type based on heading changes and displacement.
-    
-    This matches the official Waymo Open Dataset trajectory classification:
-    - STATIONARY: Total displacement < 2.0m
-    - STRAIGHT: Heading change < 15 degrees
-    - STRAIGHT_LEFT: 15° < heading < 45°, turning left
-    - STRAIGHT_RIGHT: 15° < heading < 45°, turning right  
-    - LEFT_TURN: 45° < heading < 135°, turning left
-    - RIGHT_TURN: 45° < heading < 135°, turning right
-    - LEFT_U_TURN: heading > 135°, turning left
-    - RIGHT_U_TURN: heading > 135°, turning right
-    
-    Args:
-        trajectory: [T, 2] or [T, 7] trajectory with (x, y) or full state
-            If [T, 7]: [x, y, length, width, heading, velocity_x, velocity_y]
-        valid_mask: [T] optional mask for valid timesteps
-        
-    Returns:
-        Trajectory type constant (0-7)
-    """
-    # Extract positions
-    if trajectory.shape[-1] >= 2:
-        positions = trajectory[..., :2]  # [T, 2]
-    else:
-        positions = trajectory
-    
-    # Apply valid mask
-    if valid_mask is not None:
-        valid_positions = positions[valid_mask.bool()]
-    else:
-        valid_positions = positions
-    
-    if valid_positions.shape[0] < 2:
-        return TRAJECTORY_TYPE_STATIONARY
-    
-    # Compute total displacement
-    displacement = torch.norm(valid_positions[-1] - valid_positions[0])
-    
-    # Stationary threshold: 2.0 meters
-    if displacement < 2.0:
-        return TRAJECTORY_TYPE_STATIONARY
-    
-    # Compute heading change
-    # Use displacement vectors to estimate heading
-    start_pos = valid_positions[0]
-    mid_idx = len(valid_positions) // 2
-    mid_pos = valid_positions[mid_idx]
-    end_pos = valid_positions[-1]
-    
-    # Initial heading
-    vec_start = mid_pos - start_pos
-    heading_start = torch.atan2(vec_start[1], vec_start[0])
-    
-    # Final heading  
-    vec_end = end_pos - mid_pos
-    heading_end = torch.atan2(vec_end[1], vec_end[0])
-    
-    # Heading change (normalized to [-pi, pi])
-    heading_change = heading_end - heading_start
-    heading_change = torch.atan2(torch.sin(heading_change), torch.cos(heading_change))
-    heading_change_deg = torch.abs(heading_change) * 180.0 / math.pi
-    
-    # Determine turn direction (positive = left/counter-clockwise)
-    turn_direction = torch.sign(heading_change)
-    
-    # Classify based on heading change magnitude
-    if heading_change_deg < 15.0:
-        return TRAJECTORY_TYPE_STRAIGHT
-    elif heading_change_deg < 45.0:
-        if turn_direction > 0:
-            return TRAJECTORY_TYPE_STRAIGHT_LEFT
-        else:
-            return TRAJECTORY_TYPE_STRAIGHT_RIGHT
-    elif heading_change_deg < 135.0:
-        if turn_direction > 0:
-            return TRAJECTORY_TYPE_LEFT_TURN
-        else:
-            return TRAJECTORY_TYPE_RIGHT_TURN
-    else:
-        if turn_direction > 0:
-            return TRAJECTORY_TYPE_LEFT_U_TURN
-        else:
-            return TRAJECTORY_TYPE_RIGHT_U_TURN
-
-
 def compute_precision_recall(
     pred_scores: torch.Tensor,
     pred_matched: torch.Tensor,
@@ -724,6 +335,9 @@ def compute_precision_recall(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute precision-recall curve for mAP calculation.
+    
+    Implements greedy matching: each GT can only be matched once by the
+    highest-scoring prediction that matches it. This prevents recall > 1.0.
     
     Args:
         pred_scores: [N] confidence scores for predictions
@@ -747,9 +361,20 @@ def compute_precision_recall(
     sorted_matched = pred_matched[sorted_indices]
     sorted_scores = pred_scores[sorted_indices]
     
+    # Greedy matching: each GT can only be matched once
+    # After num_gt TPs, all remaining "matched" predictions become FPs
+    tp_count = 0
+    greedy_matched = torch.zeros_like(sorted_matched, dtype=torch.bool)
+    
+    for i in range(len(sorted_matched)):
+        if sorted_matched[i] and tp_count < num_gt:
+            greedy_matched[i] = True
+            tp_count += 1
+        # else: remains False (either didn't match or GT already taken)
+    
     # Compute cumulative TP and FP
-    tp_cumsum = torch.cumsum(sorted_matched.float(), dim=0)
-    fp_cumsum = torch.cumsum((~sorted_matched).float(), dim=0)
+    tp_cumsum = torch.cumsum(greedy_matched.float(), dim=0)
+    fp_cumsum = torch.cumsum((~greedy_matched).float(), dim=0)
     
     # Compute precision and recall at each threshold
     precision = tp_cumsum / (tp_cumsum + fp_cumsum)
@@ -796,83 +421,6 @@ def compute_average_precision(
     return ap
 
 
-def compute_map_metric(
-    pred_trajectories: torch.Tensor,
-    pred_scores: torch.Tensor,
-    gt_trajectory: torch.Tensor,
-    gt_boxes: torch.Tensor,
-    valid_mask: Optional[torch.Tensor] = None,
-    measurement_step: Optional[int] = None,
-) -> torch.Tensor:
-    """
-    Compute mean Average Precision (mAP) metric with trajectory type classification.
-    
-    This implementation:
-    1. Classifies ground truth trajectory type
-    2. Classifies each predicted trajectory type  
-    3. Matches predictions to GT based on type and distance
-    4. Returns matches for later aggregation into precision-recall
-    
-    Note: This function returns per-prediction results. The final mAP
-    is computed by aggregating across all scenarios and computing
-    precision-recall curves per trajectory type.
-    
-    Args:
-        pred_trajectories: [K, T, 2] K predicted trajectories
-        pred_scores: [K] confidence scores for each prediction
-        gt_trajectory: [T, 2] or [T, 7] ground truth trajectory
-        gt_boxes: [T, 4] ground truth boxes (unused, kept for compatibility)
-        valid_mask: [T] optional mask for valid timesteps
-        measurement_step: if provided, evaluate at this step
-        
-    Returns:
-        Tuple of (gt_type, pred_types, pred_matched, pred_scores)
-        - gt_type: Ground truth trajectory type
-        - pred_types: [K] predicted trajectory types
-        - pred_matched: [K] boolean indicating if prediction matched GT
-        - pred_scores: [K] confidence scores (for precision-recall)
-    """
-    K = pred_trajectories.shape[0]
-    device = pred_trajectories.device
-    
-    # Apply measurement step
-    if measurement_step is not None:
-        pred_trajectories = pred_trajectories[:, :measurement_step, :]
-        gt_trajectory = gt_trajectory[:measurement_step, :]
-        if valid_mask is not None:
-            valid_mask = valid_mask[:measurement_step]
-    
-    # Classify ground truth trajectory
-    gt_type = classify_trajectory_type(gt_trajectory, valid_mask)
-    
-    # Classify predicted trajectories and compute distances
-    pred_types = torch.zeros(K, dtype=torch.long, device=device)
-    pred_distances = torch.zeros(K, device=device)
-    
-    for k in range(K):
-        pred_types[k] = classify_trajectory_type(
-            pred_trajectories[k], 
-            valid_mask
-        )
-        # Compute FDE as matching distance
-        pred_distances[k] = compute_min_fde(
-            pred_trajectories[k:k+1], 
-            gt_trajectory, 
-            valid_mask,
-            measurement_step=None  # Already applied above
-        )
-    
-    # Match predictions to ground truth
-    # A prediction matches if:
-    # 1. Same trajectory type as GT
-    # 2. FDE within threshold (2.0m for vehicles, 1.0m for pedestrians/cyclists)
-    match_threshold = 2.0  # meters
-    
-    pred_matched = (pred_types == gt_type) & (pred_distances <= match_threshold)
-    
-    return gt_type, pred_types, pred_matched, pred_scores
-
-
 def compute_speed(
     trajectory: torch.Tensor,
     valid_mask: Optional[torch.Tensor] = None,
@@ -891,10 +439,12 @@ def compute_speed(
         Scalar tensor with average speed in m/s
     """
     # Extract positions
-    if trajectory.shape[-1] >= 2:
-        positions = trajectory[..., :2]  # [T, 2]
+    if trajectory.shape[-1] == 7:
+        velo = trajectory[-1, -2:] # velo_x, velo_y
+        speed = torch.norm(velo)
+        return speed
     else:
-        positions = trajectory
+        positions = trajectory[..., :2]
     
     # Apply valid mask
     if valid_mask is not None:
@@ -944,8 +494,11 @@ def compute_speed_scale(
         Scalar tensor with speed scale weight (0.0 if outside bounds)
     """
     # Filter out speeds outside bounds
-    if speed < speed_lower_bound or speed > speed_upper_bound:
-        return torch.tensor(0.0, device=speed.device)
+    if speed < speed_lower_bound:
+        return torch.tensor(speed_scale_lower, device=speed.device)
+    
+    if speed > speed_upper_bound:
+        return torch.tensor(speed_scale_upper, device=speed.device)
     
     # Linear interpolation
     speed_range = speed_upper_bound - speed_lower_bound
@@ -1021,7 +574,7 @@ def compute_motion_metrics(
     # Process each scenario in batch
     for b in range(B):
         # Get ground truth for this scenario
-        gt_trajectories = ground_truth_trajectory[b]  # [A, T_gt, 2]
+        gt_trajectories = ground_truth_trajectory[b]  # [A, T_gt, 2] or [A, T_gt, 7]
         gt_valid = ground_truth_is_valid[b]  # [A, T_gt]
         obj_types = object_type[b]  # [A]
         
@@ -1032,25 +585,24 @@ def compute_motion_metrics(
             gt_indices = prediction_ground_truth_indices[b, m]  # [N]
             gt_mask = prediction_ground_truth_indices_mask[b, m]  # [N]
             
-            # Process each agent in the joint prediction
+            # Collect all agents in this joint group
+            joint_group_agents = []
             for n in range(N):
                 if not gt_mask[n]:
                     continue
                 
                 gt_idx = gt_indices[n].item()
                 if gt_idx >= A:
-                    continue
+                    raise ValueError(f"GT index {gt_idx} out of bounds for scenario {b}, group {m}, agent {n}")
                 
                 # Get ground truth for this agent
-                gt_traj = gt_trajectories[gt_idx]  # [T_gt, 2]
+                gt_traj = gt_trajectories[gt_idx]  # [T_gt, 2] or [T_gt, 7]
                 gt_valid_n = gt_valid[gt_idx]  # [T_gt]
-                obj_type = obj_types[gt_idx].item()
+                agent_type = obj_types[gt_idx].item()
                 
                 # Skip if object type not in evaluation set
-                if obj_type not in object_types:
+                if agent_type not in object_types:
                     continue
-                
-                obj_type_name = object_type_names[object_types.index(obj_type)]
                 
                 # Compute speed for this agent
                 time_step_seconds = 1.0 / config.track_steps_per_second
@@ -1065,101 +617,205 @@ def compute_motion_metrics(
                     config.speed_scale_upper,
                 )
                 
-                # Skip this agent if outside speed bounds (scale = 0)
-                if speed_scale.item() == 0.0:
-                    continue
-                
-                # Get predictions for this agent (assuming N=1 for now)
-                # If N>1, we'd need to handle joint predictions differently
-                pred_traj_n = pred_traj[:, n, :, :]  # [K, T_pred, 2]
-                
                 # Get ground truth boxes if provided
                 gt_boxes_n = None
                 if ground_truth_boxes is not None:
                     gt_boxes_n = ground_truth_boxes[b, gt_idx]  # [T_gt, 4]
                 
-                # Compute metrics for each measurement step
-                for step_config in config.step_configurations:
-                    # Convert prediction step to track step
-                    # prediction_step * (track_steps_per_second / prediction_steps_per_second)
-                    step_ratio = config.track_steps_per_second / config.prediction_steps_per_second
-                    track_step = int(step_config.measurement_step * step_ratio)
+                joint_group_agents.append({
+                    'n': n,
+                    'gt_idx': gt_idx,
+                    'gt_traj': gt_traj,
+                    'gt_valid': gt_valid_n,
+                    'agent_type': agent_type,
+                    'speed_scale': speed_scale,
+                    'gt_boxes': gt_boxes_n,
+                })
+            
+            # Skip if no valid agents in this joint group
+            if len(joint_group_agents) == 0:
+                continue
+            
+            # For joint predictions: use the least common (rarest) object type for bucketing
+            # Frequency: vehicle > pedestrian > cyclist
+            type_frequency = {TYPE_VEHICLE: 3, TYPE_PEDESTRIAN: 2, TYPE_CYCLIST: 1, TYPE_OTHER: 0}
+            least_common_type = min(joint_group_agents, key=lambda a: type_frequency.get(a['agent_type'], 0))['agent_type']
+            obj_type_name = object_type_names[object_types.index(least_common_type)]
+            
+            # Compute metrics for each measurement step
+            for step_config in config.step_configurations:
+                # Convert prediction step to track step
+                step_ratio = config.track_steps_per_second / config.prediction_steps_per_second
+                track_step = int(step_config.measurement_step * step_ratio)
+                
+                # Ensure we don't go out of bounds
+                track_step = min(track_step, T_pred - 1, T_gt - 1)
+                
+                metric_key = f"{obj_type_name}_{step_config.measurement_step}"
+                
+                # Compute minADE and minFDE for joint prediction
+                # Formula: (1/M) * min_i sum_{j=1}^M ADE_j^i
+                # where M = number of agents, i = joint prediction index, j = agent index
+                
+                ade_per_joint_pred = []  # [K] - sum of ADEs for each joint prediction
+                fde_per_joint_pred = []  # [K] - sum of FDEs for each joint prediction
+                
+                # For each of K joint predictions
+                for k in range(K):
+                    ade_sum = 0.0
+                    fde_sum = 0.0
                     
-                    # Ensure we don't go out of bounds
-                    track_step = min(track_step, T_pred - 1, T_gt - 1)
-                    
-                    metric_key = f"{obj_type_name}_{step_config.measurement_step}"
-                    
-                    # Compute minADE
-                    min_ade = compute_min_ade(
-                        pred_traj_n, gt_traj, gt_valid_n, track_step + 1
-                    )
-                    
-                    # Compute minFDE
-                    min_fde = compute_min_fde(
-                        pred_traj_n, gt_traj, gt_valid_n, track_step + 1
-                    )
-                    
-                    # Compute MissRate with lateral/longitudinal thresholds
-                    miss_rate = compute_miss_rate(
-                        pred_traj_n,
-                        gt_traj,
-                        step_config.lateral_miss_threshold,
-                        step_config.longitudinal_miss_threshold,
-                        valid_mask=gt_valid_n,
-                        measurement_step=track_step + 1,
-                    )
-                    
-                    # Compute OverlapRate
-                    if gt_boxes_n is not None:
-                        overlap_rate = compute_overlap_rate(
-                            pred_traj_n,
-                            gt_traj,
-                            gt_boxes_n,
-                            config.overlap_threshold,
-                            gt_valid_n,
-                            track_step + 1,
+                    # Sum ADE/FDE across all agents in this joint prediction
+                    for agent_info in joint_group_agents:
+                        n = agent_info['n']
+                        gt_traj = agent_info['gt_traj']
+                        gt_valid_n = agent_info['gt_valid']
+                        
+                        # Get prediction for this agent in this joint prediction
+                        pred_traj_kn = pred_traj[k:k+1, n, :, :]  # [1, T_pred, 2]
+                        
+                        # Compute ADE for this agent in this joint prediction
+                        errors = compute_displacement_error(
+                            pred_traj_kn[:, :track_step+1, :],  # [1, T, 2]
+                            gt_traj[:track_step+1, :2].unsqueeze(0),  # [1, T, 2]
+                            gt_valid_n[:track_step+1].unsqueeze(0) if gt_valid_n is not None else None,
                         )
-                    else:
-                        overlap_rate = torch.tensor(0.0, device=device)
+                        
+                        if gt_valid_n is not None:
+                            ade = errors.sum() / gt_valid_n[:track_step+1].sum().clamp(min=1.0)
+                        else:
+                            ade = errors.mean()
+                        
+                        ade_sum += ade.item()
+                        
+                        # Compute FDE for this agent in this joint prediction
+                        gt_xy = gt_traj[:, :2] if gt_traj.shape[-1] >= 7 else gt_traj
+                        pred_final = pred_traj_kn[0, track_step, :]  # [2]
+                        gt_final = gt_xy[track_step, :]  # [2]
+                        fde = torch.norm(pred_final - gt_final)
+                        
+                        fde_sum += fde.item()
                     
-                    # Compute mAP components (for later aggregation)
-                    gt_type, pred_types, pred_matched, _ = compute_map_metric(
-                        pred_traj_n,
-                        pred_scores,
-                        gt_traj,
-                        gt_boxes_n if gt_boxes_n is not None else torch.zeros(T_gt, 4, device=device),
-                        gt_valid_n,
-                        track_step + 1,
-                    )
+                    ade_per_joint_pred.append(ade_sum)
+                    fde_per_joint_pred.append(fde_sum)
+                
+                # Take minimum across K joint predictions and divide by M (number of agents)
+                M_agents = len(joint_group_agents)
+                min_ade = torch.tensor(min(ade_per_joint_pred) / M_agents, device=device)
+                min_fde = torch.tensor(min(fde_per_joint_pred) / M_agents, device=device)
+                
+                # Compute Miss Rate for joint group
+                # A miss is when NONE of the K joint predictions have ALL M agents within thresholds
+                is_miss = True
+                for k in range(K):
+                    # Check if all agents in this joint prediction k are within thresholds
+                    all_agents_within = True
+                    for agent_info in joint_group_agents:
+                        n = agent_info['n']
+                        gt_traj = agent_info['gt_traj']
+                        gt_valid_n = agent_info['gt_valid']
+                        speed_scale = agent_info['speed_scale']
+                        
+                        # Get prediction for this agent in joint prediction k
+                        pred_traj_kn = pred_traj[k:k+1, n, :, :]  # [1, T_pred, 2]
+                        
+                        # Check if this agent is within thresholds
+                        scaled_lateral_threshold = step_config.lateral_miss_threshold * speed_scale
+                        scaled_longitudinal_threshold = step_config.longitudinal_miss_threshold * speed_scale
+                        
+                        within = check_within_thresholds(
+                            pred_traj_kn,
+                            gt_traj,
+                            scaled_lateral_threshold,
+                            scaled_longitudinal_threshold,
+                            track_step,
+                            gt_valid_n
+                        )
+                        
+                        if not within.item():
+                            all_agents_within = False
+                            break
                     
-                    # Accumulate mAP data per trajectory type
-                    map_key = (obj_type, gt_type, step_config.measurement_step)
-                    if map_key not in map_accumulator:
-                        map_accumulator[map_key] = {
-                            'pred_scores': [],
-                            'pred_matched': [],
-                            'num_gt': 0
-                        }
+                    # If all agents in this joint prediction are within thresholds, not a miss
+                    if all_agents_within:
+                        is_miss = False
+                        break
+                
+                miss_rate = torch.tensor(1.0 if is_miss else 0.0, device=device)
+                
+                # Compute Overlap Rate for joint group
+                # For now, simplified: compute per agent and check if any overlap
+                # TODO: Implement full overlap checking with other objects
+                overlap_rate = torch.tensor(0.0, device=device)
+                
+                # Compute mAP for joint group
+                # Classification uses first agent's trajectory type (arbitrary selection)
+                first_agent = joint_group_agents[0]
+                gt_type = classify_trajectory_type(first_agent['gt_traj'], first_agent['gt_valid'])
+                
+                # Check if each joint prediction k is a miss (same logic as miss rate)
+                pred_matched = torch.zeros(K, dtype=torch.bool, device=device)
+                for k in range(K):
+                    all_agents_within = True
+                    for agent_info in joint_group_agents:
+                        n = agent_info['n']
+                        gt_traj = agent_info['gt_traj']
+                        gt_valid_n = agent_info['gt_valid']
+                        speed_scale = agent_info['speed_scale']
+                        
+                        pred_traj_kn = pred_traj[k:k+1, n, :, :]
+                        
+                        scaled_lateral_threshold = step_config.lateral_miss_threshold * speed_scale
+                        scaled_longitudinal_threshold = step_config.longitudinal_miss_threshold * speed_scale
+                        
+                        within = check_within_thresholds(
+                            pred_traj_kn,
+                            gt_traj,
+                            scaled_lateral_threshold,
+                            scaled_longitudinal_threshold,
+                            track_step,
+                            gt_valid_n
+                        )
+                        
+                        if not within.item():
+                            all_agents_within = False
+                            break
                     
-                    map_accumulator[map_key]['pred_scores'].append(pred_scores)
-                    map_accumulator[map_key]['pred_matched'].append(pred_matched)
-                    map_accumulator[map_key]['num_gt'] += 1  # One GT instance per scenario
-                    
-                    # Store metrics with speed scaling applied
-                    if metric_key not in metrics:
-                        metrics[f"{metric_key}/minADE"] = []
-                        metrics[f"{metric_key}/minFDE"] = []
-                        metrics[f"{metric_key}/MissRate"] = []
-                        metrics[f"{metric_key}/OverlapRate"] = []
-                        metrics[f"{metric_key}/speed_scales"] = []  # Track weights for proper averaging
-                    
-                    # Apply speed scaling weight
-                    metrics[f"{metric_key}/minADE"].append(min_ade * speed_scale)
-                    metrics[f"{metric_key}/minFDE"].append(min_fde * speed_scale)
-                    metrics[f"{metric_key}/MissRate"].append(miss_rate * speed_scale)
-                    metrics[f"{metric_key}/OverlapRate"].append(overlap_rate * speed_scale)
-                    metrics[f"{metric_key}/speed_scales"].append(speed_scale)
+                    pred_matched[k] = all_agents_within
+                
+                # At most 1 prediction can match, in case of multiple matches, keep highest score
+                if pred_matched.sum() > 1:
+                    matched_indices = torch.nonzero(pred_matched).squeeze(1)
+                    matched_scores = pred_scores[matched_indices]
+                    best_idx = matched_indices[torch.argmax(matched_scores)]
+                    pred_matched[:] = False
+                    pred_matched[best_idx] = True
+                
+                # Accumulate mAP data per trajectory type
+                map_key = (least_common_type, gt_type, step_config.measurement_step)
+                if map_key not in map_accumulator:
+                    map_accumulator[map_key] = {
+                        'pred_scores': [],
+                        'pred_matched': [],
+                        'num_gt': 0
+                    }
+                
+                map_accumulator[map_key]['pred_scores'].append(pred_scores)
+                map_accumulator[map_key]['pred_matched'].append(pred_matched)
+                map_accumulator[map_key]['num_gt'] += 1
+                
+                # Store metrics once per joint group
+                if metric_key not in metrics:
+                    metrics[f"{metric_key}/minADE"] = []
+                    metrics[f"{metric_key}/minFDE"] = []
+                    metrics[f"{metric_key}/MissRate"] = []
+                    metrics[f"{metric_key}/OverlapRate"] = []
+                
+                # Store all metrics for the joint group
+                metrics[f"{metric_key}/minADE"].append(min_ade)
+                metrics[f"{metric_key}/minFDE"].append(min_fde)
+                metrics[f"{metric_key}/MissRate"].append(miss_rate)
+                metrics[f"{metric_key}/OverlapRate"].append(overlap_rate)
     
     # Compute mAP from accumulated predictions
     # For each (object_type, trajectory_type, measurement_step), compute AP
@@ -1186,33 +842,22 @@ def compute_motion_metrics(
         metric_key = f"{obj_type_name}_{meas_step}/mAP_{traj_type_name}"
         map_results[metric_key] = ap
     
-    # Compute weighted average metrics using speed scales
+    # Compute simple average of metrics
     result = {}
     metric_keys_to_average = set()
     for key in metrics.keys():
-        if not key.endswith('/speed_scales'):
-            base_key = key.rsplit('/', 1)[0]  # Get VEHICLE_5 from VEHICLE_5/minADE
-            metric_keys_to_average.add(base_key)
+        base_key = key.rsplit('/', 1)[0]  # Get VEHICLE_5 from VEHICLE_5/minADE
+        metric_keys_to_average.add(base_key)
     
     for base_key in metric_keys_to_average:
-        # Get speed scales for this base key
-        scale_key = f"{base_key}/speed_scales"
-        if scale_key in metrics and metrics[scale_key]:
-            scales = torch.stack(metrics[scale_key])
-            total_scale = scales.sum()
-            
-            # Weighted average for each metric type
-            for metric_name in ['minADE', 'minFDE', 'MissRate', 'OverlapRate']:
-                full_key = f"{base_key}/{metric_name}"
-                if full_key in metrics and metrics[full_key]:
-                    values = torch.stack(metrics[full_key])
-                    # Values are already scaled, just need to normalize by total weight
-                    if total_scale > 0:
-                        result[full_key] = values.sum() / total_scale
-                    else:
-                        result[full_key] = torch.tensor(0.0, device=device)
-                else:
-                    result[full_key] = torch.tensor(0.0, device=device)
+        # Simple average for each metric type
+        for metric_name in ['minADE', 'minFDE', 'MissRate', 'OverlapRate']:
+            full_key = f"{base_key}/{metric_name}"
+            if full_key in metrics and metrics[full_key]:
+                values = torch.stack(metrics[full_key])
+                result[full_key] = values.mean()
+            else:
+                result[full_key] = torch.tensor(0.0, device=device)
     
     # Add mAP results
     result.update(map_results)
